@@ -1,0 +1,7 @@
+.env
+.server-ip
+*.env.local
+.workstreams/
+.worktrees/
+.playwright-mcp/
+.claude/
