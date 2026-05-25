@@ -69,7 +69,6 @@ cmd_create() {
   local name="$1"
   local stack_dir="${STACKS_DIR}/${name}"
   local domain="${name}.${DEV_DOMAIN}"
-  local studio_domain="studio-${name}.${DEV_DOMAIN}"
 
   if [[ -d "$stack_dir" ]]; then
     echo "❌ Stack '${name}' already exists"
@@ -84,19 +83,16 @@ cmd_create() {
   echo "  Creating stack: ${name}"
   echo "  Ports: ${port_base}-${port_end}"
   echo "  API: https://${domain}"
-  echo "  Studio: https://${studio_domain}"
   echo "═══════════════════════════════════════════"
 
   mkdir -p "$stack_dir"
 
   # Generate secrets
-  local jwt_secret db_password anon_key service_key studio_username studio_password studio_hash
+  local jwt_secret db_password anon_key service_key
   jwt_secret=$(generate_jwt_secret)
   db_password=$(generate_password)
   anon_key=$(generate_jwt "$jwt_secret" "anon")
   service_key=$(generate_jwt "$jwt_secret" "service_role")
-  studio_username="studio"
-  studio_password=$(generate_password)
 
   # Port assignments
   local port_db=$((port_base + 0))
@@ -104,9 +100,7 @@ cmd_create() {
   local port_kong_ssl=$((port_base + 2))
   local port_auth=$((port_base + 3))
   local port_rest=$((port_base + 4))
-  local port_studio=$((port_base + 5))
-  local port_meta=$((port_base + 6))
-  local port_storage=$((port_base + 7))
+  local port_storage=$((port_base + 5))
 
   # ── Generate docker-compose.yml ──
   sed \
@@ -119,8 +113,6 @@ cmd_create() {
     -e "s|__PORT_KONG_SSL__|${port_kong_ssl}|g" \
     -e "s|__PORT_AUTH__|${port_auth}|g" \
     -e "s|__PORT_REST__|${port_rest}|g" \
-    -e "s|__PORT_STUDIO__|${port_studio}|g" \
-    -e "s|__PORT_META__|${port_meta}|g" \
     -e "s|__PORT_STORAGE__|${port_storage}|g" \
     -e "s|__DB_PASSWORD__|${db_password}|g" \
     -e "s|__JWT_SECRET__|${jwt_secret}|g" \
@@ -136,19 +128,11 @@ cmd_create() {
     -e "s|__SERVICE_KEY__|${service_key}|g" \
     "${SCRIPTS_DIR}/kong.yml.tpl" > "${stack_dir}/kong.yml"
 
-  # ── Protect Supabase Studio ──
-  studio_hash=$(openssl passwd -apr1 "${studio_password}")
-  printf "%s:%s\n" "${studio_username}" "${studio_hash}" > "${stack_dir}/studio.htpasswd"
-  chown root:www-data "${stack_dir}/studio.htpasswd"
-  chmod 640 "${stack_dir}/studio.htpasswd"
-
   # ── Generate nginx site config ──
   sed \
     -e "s|__PROJECT_NAME__|${name}|g" \
     -e "s|__DEV_DOMAIN__|${DEV_DOMAIN}|g" \
-    -e "s|__STUDIO_DOMAIN__|${studio_domain}|g" \
     -e "s|__PORT_KONG__|${port_kong}|g" \
-    -e "s|__PORT_STUDIO__|${port_studio}|g" \
     -e "s|__TIMESTAMP__|$(date -u +"%Y-%m-%dT%H:%M:%SZ")|g" \
     "${SCRIPTS_DIR}/nginx-site.conf.tpl" > "${NGINX_SITES}/${name}.conf"
 
@@ -159,22 +143,17 @@ cmd_create() {
   "port_base": ${port_base},
   "port_end": ${port_end},
   "domain": "${domain}",
-  "studio_domain": "${studio_domain}",
   "created_at": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
   "jwt_secret": "${jwt_secret}",
   "db_password": "${db_password}",
   "anon_key": "${anon_key}",
   "service_key": "${service_key}",
-  "studio_username": "${studio_username}",
-  "studio_password": "${studio_password}",
   "ports": {
     "db": ${port_db},
     "kong": ${port_kong},
     "kong_ssl": ${port_kong_ssl},
     "auth": ${port_auth},
     "rest": ${port_rest},
-    "studio": ${port_studio},
-    "meta": ${port_meta},
     "storage": ${port_storage}
   }
 }
@@ -217,16 +196,11 @@ EOF
   echo "═══════════════════════════════════════════"
   echo ""
   echo "  API:     https://${domain}"
-  echo "  Studio:  https://${studio_domain}"
-  echo "  Studio username: ${studio_username}"
-  echo "  Studio password: ${studio_password}"
   echo "  DB:      postgresql://postgres:${db_password}@${DEV_DOMAIN}:${port_db}/postgres"
   echo ""
   echo "  SUPABASE_URL=https://${domain}"
   echo "  SUPABASE_ANON_KEY=${anon_key}"
   echo "  SUPABASE_SERVICE_ROLE_KEY=${service_key}"
-  echo ""
-  echo "  Retrieve Studio credentials later with: stack.sh studio ${name}"
   echo ""
 }
 
@@ -355,39 +329,6 @@ DATABASE_URL=postgresql://postgres:${db_password}@$(hostname -I | awk '{print $1
 EOF
 }
 
-cmd_studio() {
-  local name="$1"
-  local stack_dir="${STACKS_DIR}/${name}"
-
-  if [[ ! -d "$stack_dir" ]]; then
-    echo "❌ Stack '${name}' not found"
-    exit 1
-  fi
-
-  local meta="${stack_dir}/metadata.json"
-  local domain studio_domain studio_username studio_password
-
-  domain=$(jq -r '.domain' "$meta")
-  studio_domain=$(jq -r '.studio_domain // empty' "$meta")
-  studio_username=$(jq -r '.studio_username // empty' "$meta")
-  studio_password=$(jq -r '.studio_password // empty' "$meta")
-
-  [[ -z "$studio_domain" ]] && studio_domain="studio-${name}.${DEV_DOMAIN}"
-
-  if [[ -z "$studio_username" || -z "$studio_password" ]]; then
-    echo "❌ Studio credentials not found for '${name}'"
-    echo "   Recreate the stack to generate per-stack Studio basic auth."
-    exit 1
-  fi
-
-  cat <<EOF
-SUPABASE_STUDIO_URL=https://${studio_domain}
-SUPABASE_STUDIO_USERNAME=${studio_username}
-SUPABASE_STUDIO_PASSWORD=${studio_password}
-SUPABASE_API_URL=https://${domain}
-EOF
-}
-
 # ── Main ──
 
 COMMAND="${1:-help}"
@@ -422,11 +363,6 @@ case "$COMMAND" in
     validate_name "$NAME"
     cmd_env "$NAME"
     ;;
-  studio)
-    [[ -z "$NAME" ]] && { echo "Usage: stack.sh studio <name>"; exit 1; }
-    validate_name "$NAME"
-    cmd_studio "$NAME"
-    ;;
   *)
     echo "Usage: stack.sh <command> [name]"
     echo ""
@@ -437,6 +373,5 @@ case "$COMMAND" in
     echo "  status  <name>   Show container status for a stack"
     echo "  restart <name>   Restart a stack"
     echo "  env     <name>   Print env vars for a stack"
-    echo "  studio  <name>   Print Studio URL and basic auth credentials"
     ;;
 esac
