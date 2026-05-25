@@ -108,8 +108,8 @@ services:
     image: kong:2.8.1
     container_name: __PROJECT_NAME__-kong
     restart: unless-stopped
-    mem_limit: 128m
-    cpus: 0.25
+    mem_limit: 256m
+    cpus: 0.5
     ports:
       - "127.0.0.1:__PORT_KONG__:8000"
       - "127.0.0.1:__PORT_KONG_SSL__:8443"
