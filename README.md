@@ -197,21 +197,6 @@ DATABASE_URL=postgresql://...
 processes running on the VPS, or through an SSH tunnel. Do not expose database
 ports publicly.
 
-### 6. Print Studio Credentials
-
-```bash
-./scripts/stack.sh studio feature-login
-```
-
-Example output:
-
-```bash
-SUPABASE_STUDIO_URL=https://studio-feature-login.dev.example.com
-SUPABASE_STUDIO_USERNAME=studio
-SUPABASE_STUDIO_PASSWORD=...
-SUPABASE_API_URL=https://feature-login.dev.example.com
-```
-
 ## Commands
 
 | Command | Description |
@@ -223,8 +208,21 @@ SUPABASE_API_URL=https://feature-login.dev.example.com
 | `./scripts/stack.sh list` | List active stacks |
 | `./scripts/stack.sh status <name>` | Show container status for a stack |
 | `./scripts/stack.sh restart <name>` | Restart all containers in a stack |
+| `./scripts/stack.sh hibernate <name>` | Stop a stack's containers, keeping all data |
+| `./scripts/stack.sh wake <name>` | Restart a hibernated stack's containers |
 | `./scripts/stack.sh env <name>` | Print env vars for a stack |
-| `./scripts/stack.sh studio <name>` | Print Studio URL and basic auth credentials |
+
+## Fleet Capacity
+
+At most `MAX_RUNNING_STACKS` stacks (default 12) run at once. When `create` or
+`wake` would exceed the cap, the least-recently-active running stack is
+hibernated automatically — its containers stop but its data is preserved —
+which bounds worst-case container memory. Wake a hibernated stack with
+`./scripts/stack.sh wake <name>`. Only `create`, `wake`, and `restart`
+refresh a stack's LRU timestamp — serving traffic does not — so a stack
+that looks idle by LRU can be hibernated at capacity even while receiving
+requests; its PR's next push wakes it. Override the cap by setting
+`MAX_RUNNING_STACKS` in `.env`; `stack.sh` passes it through to the server.
 
 ## Workstream Helpers
 
@@ -292,7 +290,6 @@ A  *.DEV_DOMAIN
 - `.env`, `.server-ip`, `.env.local`, and `.workstreams/` are gitignored.
 - Each stack gets generated database, JWT, anon, service role, and Studio credentials.
 - Supabase Studio runs on a separate hostname and is protected with per-stack basic auth.
-- Studio credentials are retrieved with `./scripts/stack.sh studio <name>`, not included in app env output.
 - Supabase API routes remain publicly reachable at the stack subdomain and rely on Supabase keys/policies.
 - The service role key is printed for server-side tooling only; never expose it to browser code.
 - The Hetzner firewall exposes only SSH, HTTP, and HTTPS.
