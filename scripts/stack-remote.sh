@@ -10,6 +10,11 @@ NGINX_SITES="/opt/supabase/nginx/sites-enabled"
 PORT_BASE="${SUPABASE_PORT_BASE:-54320}"
 PORT_BLOCK="${SUPABASE_PORT_BLOCK:-20}"
 DEV_DOMAIN="${DEV_DOMAIN:-dev.example.com}"
+MAX_RUNNING_STACKS="${MAX_RUNNING_STACKS:-12}"
+if [[ ! "$MAX_RUNNING_STACKS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "❌ MAX_RUNNING_STACKS must be a positive integer (got '${MAX_RUNNING_STACKS}')" >&2
+  exit 1
+fi
 
 # ── Helpers ──
 
@@ -19,6 +24,93 @@ generate_jwt_secret() {
 
 generate_password() {
   openssl rand -base64 24 | tr -d '/+=' | head -c 32
+}
+
+# A stack counts as "running" when any of its containers is running —
+# the cap bounds memory, and partial stacks (db down, others up) still
+# consume it. Containers are matched by the <name>- prefix.
+stack_running() {
+  local name="$1"
+  docker ps -q --filter "name=^/${name}-" | grep -q .
+}
+
+touch_last_active() {
+  touch "${STACKS_DIR}/$1/.last-active"
+}
+
+# LRU sort key: .last-active mtime, falling back to metadata.json mtime
+# for stacks created before this feature existed.
+last_active_epoch() {
+  local dir="${STACKS_DIR}/$1"
+  if [[ -f "${dir}/.last-active" ]]; then
+    stat -c %Y "${dir}/.last-active"
+  else
+    stat -c %Y "${dir}/metadata.json"
+  fi
+}
+
+# Start any exited <name>-* sidecar containers (e.g. <name>-dtu) that
+# hibernation stopped — compose only manages the stack's own services.
+start_sidecars() {
+  local name="$1"
+  local sidecars
+  sidecars=$(docker ps -a --filter "name=^/${name}-" --filter "status=exited" -q)
+  if [[ -n "$sidecars" ]]; then
+    # shellcheck disable=SC2086
+    docker start $sidecars > /dev/null
+  fi
+}
+
+# The <name>-* container filters are only safe when no stack name is a
+# dash-prefix of another. New conflicts are blocked at create; this guards
+# against pre-existing ones before any cross-stack docker stop/start.
+require_no_name_conflicts() {
+  local name="$1"
+  local dir other
+  for dir in "$STACKS_DIR"/*/; do
+    [[ -d "$dir" ]] || continue
+    other=$(basename "$dir")
+    [[ "$other" == "$name" ]] && continue
+    if [[ "$other" == "$name"-* || "$name" == "$other"-* ]]; then
+      echo "❌ Stack name '${name}' conflicts with existing stack '${other}'; resolve before hibernate/wake" >&2
+      exit 1
+    fi
+  done
+}
+
+# Hibernate least-recently-active running stacks until a slot is free.
+# $1 = stack name to exclude from eviction (the one being created/woken).
+# Callers (preview-db.sh, stack.sh) hold the server-side flock, so this is race-free.
+ensure_capacity() {
+  local exclude="${1:-}"
+  while :; do
+    local running=()
+    local meta name
+    # Derive the name from the directory, not metadata.json, so a corrupt
+    # metadata file can't brick capacity enforcement for every create/wake.
+    for meta in "$STACKS_DIR"/*/metadata.json; do
+      [[ -f "$meta" ]] || continue
+      name=$(basename "$(dirname "$meta")")
+      [[ "$name" == "$exclude" ]] && continue
+      stack_running "$name" && running+=("$name")
+    done
+    (( ${#running[@]} < MAX_RUNNING_STACKS )) && break
+
+    local lru="" lru_epoch=0 epoch
+    for name in "${running[@]}"; do
+      epoch=$(last_active_epoch "$name")
+      if [[ -z "$lru" ]] || (( epoch < lru_epoch )); then
+        lru="$name"
+        lru_epoch="$epoch"
+      fi
+    done
+    if [[ -z "$lru" ]]; then
+      echo "⚠️  At capacity but found no hibernation candidate; continuing anyway"
+      break
+    fi
+    echo "📉 At capacity (${#running[@]}/${MAX_RUNNING_STACKS} running) — hibernating least-recently-active stack '${lru}'"
+    cmd_hibernate "$lru"
+  done
 }
 
 validate_name() {
@@ -74,6 +166,20 @@ cmd_create() {
     echo "❌ Stack '${name}' already exists"
     exit 1
   fi
+
+  # Container cleanup filters match "<name>-*", so no stack name may be a
+  # dash-prefix of another (e.g. "pr-1" and "pr-1-hotfix" would collide).
+  local existing_dir existing
+  for existing_dir in "$STACKS_DIR"/*/; do
+    [[ -d "$existing_dir" ]] || continue
+    existing=$(basename "$existing_dir")
+    if [[ "$existing" == "$name"-* || "$name" == "$existing"-* ]]; then
+      echo "❌ Stack name '${name}' conflicts with existing stack '${existing}' (stack names must not be dash-prefixes of each other)"
+      exit 1
+    fi
+  done
+
+  ensure_capacity "$name"
 
   local port_base
   port_base=$(next_port_base)
@@ -187,6 +293,8 @@ EOF
   echo "🚀 Starting services..."
   (cd "$stack_dir" && docker compose up -d)
 
+  touch_last_active "$name"
+
   # ── Reload nginx ──
   nginx -t && systemctl reload nginx
 
@@ -265,7 +373,7 @@ cmd_list() {
     elif (( running > 0 )); then
       status="⚠️  ${running}/${total}"
     else
-      status="❌ stopped"
+      status="💤 hibernated"
     fi
 
     printf "  %-20s %-35s %-15s\n" "$name" "https://${domain}" "$status"
@@ -296,9 +404,61 @@ cmd_restart() {
     exit 1
   fi
 
+  require_no_name_conflicts "$name"
+
   echo "🔄 Restarting stack: ${name}"
+  ensure_capacity "$name"
   (cd "$stack_dir" && docker compose restart)
+  start_sidecars "$name"
+  touch_last_active "$name"
   echo "✅ Restarted"
+}
+
+cmd_hibernate() {
+  local name="$1"
+  local stack_dir="${STACKS_DIR}/${name}"
+
+  if [[ ! -d "$stack_dir" ]]; then
+    echo "❌ Stack '${name}' not found"
+    exit 1
+  fi
+
+  require_no_name_conflicts "$name"
+
+  echo "💤 Hibernating stack: ${name}"
+  # The trailing dash keeps pr-1 from matching pr-19-db. Also catches
+  # consumer sidecars (e.g. pr-42-dtu) that aren't in the compose file.
+  local containers
+  containers=$(docker ps --filter "name=^/${name}-" -q)
+  if [[ -n "$containers" ]]; then
+    # shellcheck disable=SC2086
+    docker stop $containers > /dev/null
+  fi
+  echo "💤 Stack '${name}' hibernated (data preserved; wake with: stack.sh wake ${name})"
+}
+
+cmd_wake() {
+  local name="$1"
+  local stack_dir="${STACKS_DIR}/${name}"
+
+  if [[ ! -d "$stack_dir" ]]; then
+    echo "❌ Stack '${name}' not found"
+    exit 1
+  fi
+
+  require_no_name_conflicts "$name"
+
+  ensure_capacity "$name"
+
+  echo "⏰ Waking stack: ${name}"
+  # "up -d" rather than "start": idempotent, and also recovers stacks whose
+  # containers were removed entirely (cmd_list labels those hibernated too).
+  (cd "$stack_dir" && docker compose up -d)
+
+  start_sidecars "$name"
+
+  touch_last_active "$name"
+  echo "✅ Stack '${name}' awake"
 }
 
 cmd_env() {
@@ -358,6 +518,16 @@ case "$COMMAND" in
     validate_name "$NAME"
     cmd_restart "$NAME"
     ;;
+  hibernate)
+    [[ -z "$NAME" ]] && { echo "Usage: stack.sh hibernate <name>"; exit 1; }
+    validate_name "$NAME"
+    cmd_hibernate "$NAME"
+    ;;
+  wake)
+    [[ -z "$NAME" ]] && { echo "Usage: stack.sh wake <name>"; exit 1; }
+    validate_name "$NAME"
+    cmd_wake "$NAME"
+    ;;
   env)
     [[ -z "$NAME" ]] && { echo "Usage: stack.sh env <name>"; exit 1; }
     validate_name "$NAME"
@@ -372,6 +542,8 @@ case "$COMMAND" in
     echo "  list             List all active stacks"
     echo "  status  <name>   Show container status for a stack"
     echo "  restart <name>   Restart a stack"
+    echo "  hibernate <name> Stop a stack's containers, keeping data (auto-evicted LRU at capacity)"
+    echo "  wake    <name>   Restart a hibernated stack's containers"
     echo "  env     <name>   Print env vars for a stack"
     ;;
 esac

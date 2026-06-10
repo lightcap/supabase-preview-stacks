@@ -35,6 +35,18 @@ echo "📦 Updating system..."
 apt-get update -qq
 apt-get upgrade -y -qq
 
+# ── Swap (pressure valve: fleet overload degrades instead of hard-hanging) ──
+echo "💾 Provisioning swap..."
+if ! swapon --show | grep -q /swapfile; then
+  fallocate -l 8G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  grep -q '^/swapfile ' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+echo 'vm.swappiness=10' > /etc/sysctl.d/99-swap.conf
+sysctl -p /etc/sysctl.d/99-swap.conf
+
 # ── Docker ──
 echo "🐳 Installing Docker..."
 if ! command -v docker &>/dev/null; then

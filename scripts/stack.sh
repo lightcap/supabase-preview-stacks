@@ -30,10 +30,10 @@ NAME="${2:-}"
 EXTRA="${3:-}"
 
 case "$COMMAND" in
-  create|destroy|env|studio|list|status|restart|help) ;;
+  create|destroy|env|list|status|restart|hibernate|wake|help) ;;
   *)
     echo "Unknown command: ${COMMAND}" >&2
-    echo "Usage: stack.sh <create|destroy|env|studio|list|status|restart> [name]" >&2
+    echo "Usage: stack.sh <create|destroy|env|list|status|restart|hibernate|wake> [name]" >&2
     exit 1
     ;;
 esac
@@ -48,31 +48,51 @@ if [[ "$COMMAND" == "destroy" && -n "$EXTRA" && "$EXTRA" != "--force" ]]; then
   exit 1
 fi
 
-# Pass config as env vars to the remote script
-REMOTE_ENV="DEV_DOMAIN=${DEV_DOMAIN} SUPABASE_PORT_BASE=${SUPABASE_PORT_BASE} SUPABASE_PORT_BLOCK=${SUPABASE_PORT_BLOCK}"
+# Pass config as env vars to the remote script (%q-quoted: .env values are
+# untrusted input to the remote shell)
+printf -v REMOTE_ENV 'DEV_DOMAIN=%q SUPABASE_PORT_BASE=%q SUPABASE_PORT_BLOCK=%q' "$DEV_DOMAIN" "$SUPABASE_PORT_BASE" "$SUPABASE_PORT_BLOCK"
+if [[ -n "${MAX_RUNNING_STACKS:-}" ]]; then
+  printf -v REMOTE_ENV '%s MAX_RUNNING_STACKS=%q' "$REMOTE_ENV" "$MAX_RUNNING_STACKS"
+fi
 
-# shellcheck disable=SC2086
+# Run the remote stack script under the server-side lock so concurrent
+# invocations (CI, other shells) serialize. Pass -q first to silence ssh.
+remote_stack() {
+  local quiet=""
+  if [[ "${1:-}" == "-q" ]]; then
+    quiet="-q"
+    shift
+  fi
+  local remote_cmd="${REMOTE_ENV} /opt/supabase/scripts/stack.sh"
+  local arg quoted_arg
+  for arg in "$@"; do
+    printf -v quoted_arg '%q' "$arg"
+    remote_cmd="${remote_cmd} ${quoted_arg}"
+  done
+  local locked_cmd
+  printf -v locked_cmd 'flock /opt/supabase/scripts/.stack.lock bash -lc %q' "$remote_cmd"
+  # shellcheck disable=SC2086
+  ssh $quiet $SSH_OPTS root@"${SERVER_IP}" "$locked_cmd"
+}
+
 case "$COMMAND" in
   env)
-    ssh -q $SSH_OPTS root@"${SERVER_IP}" "${REMOTE_ENV} /opt/supabase/scripts/stack.sh env ${NAME}"
-    ;;
-  studio)
-    ssh -q $SSH_OPTS root@"${SERVER_IP}" "${REMOTE_ENV} /opt/supabase/scripts/stack.sh studio ${NAME}"
+    remote_stack -q env "${NAME}"
     ;;
   create)
-    ssh $SSH_OPTS root@"${SERVER_IP}" "${REMOTE_ENV} /opt/supabase/scripts/stack.sh create ${NAME}"
+    remote_stack create "${NAME}"
     ;;
   destroy)
-    ssh $SSH_OPTS root@"${SERVER_IP}" "${REMOTE_ENV} /opt/supabase/scripts/stack.sh destroy ${NAME} ${EXTRA}"
+    remote_stack destroy "${NAME}" "${EXTRA}"
     ;;
   list)
-    ssh $SSH_OPTS root@"${SERVER_IP}" "${REMOTE_ENV} /opt/supabase/scripts/stack.sh list"
+    remote_stack list
     ;;
-  status|restart)
-    ssh $SSH_OPTS root@"${SERVER_IP}" "${REMOTE_ENV} /opt/supabase/scripts/stack.sh ${COMMAND} ${NAME}"
+  status|restart|hibernate|wake)
+    remote_stack "${COMMAND}" "${NAME}"
     ;;
   help)
-    ssh $SSH_OPTS root@"${SERVER_IP}" "${REMOTE_ENV} /opt/supabase/scripts/stack.sh help"
+    remote_stack help
     ;;
   *)
     echo "Unknown command: ${COMMAND}" >&2
