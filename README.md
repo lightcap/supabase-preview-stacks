@@ -17,12 +17,12 @@ operational risks.
 ## What You Get
 
 - One isolated Supabase stack per project, branch, or workstream.
-- Separate API and Studio subdomains for each stack, such as `feature-login.dev.example.com` and `studio-feature-login.dev.example.com`.
+- A dedicated API subdomain for each stack, such as `feature-login.dev.example.com`.
 - Automated Hetzner server provisioning.
 - Automated DNS records with DNSimple, or printed manual records for Route53.
 - Wildcard TLS with Let's Encrypt.
-- nginx routing for API, auth, storage, and Studio.
-- Generated Postgres password, JWT secret, anon key, service role key, and Studio login per stack.
+- nginx routing for API, auth, and storage.
+- Generated Postgres password, JWT secret, anon key, and service role key per stack.
 - Optional helpers for Vercel env merging and `.env.local` switching.
 
 ## Development Only
@@ -47,9 +47,6 @@ hardening. Before exposing this to teammates or the public internet, read
       /auth/v1     -> Kong -> GoTrue
       /rest/v1     -> Kong -> PostgREST
       /storage/v1  -> Kong -> Storage API
-
-   studio-feature-login.dev.example.com
-      /            -> Supabase Studio, protected by basic auth
         |
         v
  project-a containers   project-b containers   project-c containers
@@ -57,7 +54,7 @@ hardening. Before exposing this to teammates or the public internet, read
 ```
 
 Each stack runs Docker Compose services for Postgres, Kong, GoTrue, PostgREST,
-Supabase Studio, postgres-meta, and Storage.
+and Storage.
 
 ## Prerequisites
 
@@ -162,8 +159,8 @@ templates, and obtains a wildcard certificate.
 ```
 
 Stack names must be DNS-safe labels up to 56 characters: lowercase letters,
-numbers, and dashes; no leading or trailing dash. The shorter limit leaves room
-for the generated `studio-<name>` hostname.
+numbers, and dashes; no leading or trailing dash. A stack name may not be a
+dash-prefix of an existing stack (e.g. `pr-1` alongside `pr-1-hotfix`).
 
 The command prints connection details:
 
@@ -171,9 +168,6 @@ The command prints connection details:
 SUPABASE_URL=https://feature-login.dev.example.com
 SUPABASE_ANON_KEY=...
 SUPABASE_SERVICE_ROLE_KEY=...
-Studio URL: https://studio-feature-login.dev.example.com
-Studio username: studio
-Studio password: ...
 ```
 
 ### 5. Print App Environment Variables
@@ -288,8 +282,7 @@ A  *.DEV_DOMAIN
 ## Security Defaults
 
 - `.env`, `.server-ip`, `.env.local`, and `.workstreams/` are gitignored.
-- Each stack gets generated database, JWT, anon, service role, and Studio credentials.
-- Supabase Studio runs on a separate hostname and is protected with per-stack basic auth.
+- Each stack gets generated database, JWT, anon, and service role credentials.
 - Supabase API routes remain publicly reachable at the stack subdomain and rely on Supabase keys/policies.
 - The service role key is printed for server-side tooling only; never expose it to browser code.
 - The Hetzner firewall exposes only SSH, HTTP, and HTTPS.
@@ -302,7 +295,7 @@ A  *.DEV_DOMAIN
 - It does not manage backups, upgrades, observability, team access, or data branching.
 - Supabase image versions are pinned in `templates/docker-compose.yml.tpl` and must be updated manually.
 - DNS automation is intentionally small: DNSimple records are automated; DNSimple and Route53 are supported for certbot DNS challenges.
-- Studio basic auth is applied when a stack is created; recreate existing stacks to pick up the generated Studio hostname and credentials.
+- There is no bundled admin UI (Studio was removed in #3 to fit more stacks per server); use `DATABASE_URL` with psql or a local client over an SSH tunnel.
 - This is cheaper and more controllable than managed preview stacks, but you own the operations.
 
 ## File Structure
